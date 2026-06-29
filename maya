@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""maya — the local CLI that connects a machine's background coding agent to the Maya voice commander.
+
+PATH B (the $0 / legal model): this CLI runs on the OWNER's machine and talks ONLY to the Maya cloud
+over HTTP. It NEVER touches Anthropic credentials, never holds an API key, and is dependency-light
+(stdlib urllib only) so it installs anywhere with zero friction. The owner's coding agent keeps
+running on the owner's own Pro/Max subscription; Maya is just the remote voice layer.
+
+🔴 IRON RULE (enforced here): never run an agent with ANTHROPIC_API_KEY set — that flips Claude Code
+to API billing and breaks the "$0 / own subscription" premise. This CLI itself spawns no agent, but
+it WARNS at `maya pair` if the key is set in the environment, and it scrubs the key from its own
+process env defensively (so nothing it might ever spawn inherits it).
+
+Subcommands:
+  maya pair <code>            One-time: redeem the PIN-gated pairing code Maya gave you on the call.
+                              Stores the machine token + your caller_id 0600 in ~/.maya/config.
+  maya discuss "<brief>"      POST a thick brief → print the job_id and exit 0 in <5s (NON-BLOCKING,
+                              the 600s-Bash-cap fix). Maya phones you; the Stop hook re-polls.
+  maya discuss --poll <id>    ONE bounded poll (~60s). Prints the resolved instruction (exit 0) or a
+                              PENDING sentinel (exit 0) — never a hang, never an error exit on pending.
+
+Config:
+  MAYA_CLOUD_URL   base URL of the Maya cloud (default https://maya-realtime.fly.dev).
+  ~/.maya/config   JSON {token, owner_caller_id, cloud_url}, mode 0600, gitignored.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.maya")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
+SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
+DEFAULT_CLOUD_URL = "https://maya-realtime.fly.dev"
+
+# Per-poll budget well under the 600s Bash hard cap (the audit's adjudicated ~60s, not 300s): each
+# foreground `maya discuss --poll` stays far from the cliff; the Stop hook re-arms across turns.
+POLL_BUDGET_SECONDS = 60
+POLL_INTERVAL_SECONDS = 3
+POST_TIMEOUT_SECONDS = 10
+
+
+SEAM_LOG = os.path.join(CONFIG_DIR, "commander.log")
+
+
+# --------------------------------------------------------------------------- env hygiene
+def _scrub_api_key() -> None:
+    """Defensively remove ANTHROPIC_API_KEY from this process env (Path B: subscription billing only)."""
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
+def _log_seam(seam: str, job_id: str = "", extra: str = "") -> None:
+    """Append one client-side seam line to ~/.maya/commander.log for the M3 trigger-rate measurement.
+
+    Seams: cli-posted (discuss created a job), cli-resolved (poll got the instruction), cli-pending
+    (poll timed out, still discussing). The Stop hook logs hook-blocked. `maya trigger-rate` tallies
+    these to compute the hook→skill→CLI→resolve funnel that gates the GO/NO-GO decision. Best-effort —
+    never raises (logging must not break the CLI). No timestamp from a clock the tests can't control;
+    we log a monotonic-free line and let the OS file mtime / line order carry ordering."""
+    try:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        with open(SEAM_LOG, "a", encoding="utf-8") as fh:
+            line = f"seam={seam} job_id={job_id or '-'}"
+            if extra:
+                line += f" {extra}"
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- config io
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_config(cfg: dict) -> None:
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    # Create 0600 ATOMICALLY (os.open with the mode), not open()+chmod — a plain open() honors the
+    # umask (commonly 0644) and the bearer token would be briefly world-readable on a shared machine
+    # before the chmod (a TOCTOU window). O_CREAT|O_TRUNC with mode 0o600 closes that window; the
+    # mode only applies on creation, so re-saving an existing 0600 file keeps it 0600.
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    os.chmod(CONFIG_PATH, 0o600)  # belt-and-suspenders: also tighten a pre-existing looser file
+
+
+def _cloud_url(cfg: dict) -> str:
+    return (os.environ.get("MAYA_CLOUD_URL") or cfg.get("cloud_url") or DEFAULT_CLOUD_URL).rstrip("/")
+
+
+# --------------------------------------------------------------------------- http
+def _as_dict(raw: bytes) -> dict:
+    """Decode a response body to a dict, coercing ANY non-object JSON (list/string/number from a CDN
+    error page, proxy, or schema drift) to {} so every caller's body.get(...) is safe. A non-dict body
+    that crashed body.get would break the advertised exit-0 poll contract the Stop hook relies on."""
+    try:
+        parsed = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:  # noqa: BLE001
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _post(url: str, payload: dict, *, token: str | None = None, timeout: int = POST_TIMEOUT_SECONDS):
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, _as_dict(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, _as_dict(e.read())
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, {"error": f"network: {e}"}
+
+
+def _get(url: str, *, token: str | None = None, timeout: int = POST_TIMEOUT_SECONDS):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, _as_dict(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, _as_dict(e.read())
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, {"error": f"network: {e}"}
+
+
+# --------------------------------------------------------------------------- session id
+def _session_id() -> str:
+    """The originating session's stable id so the Stop hook can re-poll the right job across turns.
+
+    Prefer the harness-exposed CLAUDE_SESSION_ID; else mint+persist our own UUID under ~/.maya/sessions
+    keyed by cwd (the per-cwd lock file the phase-2 round-trip answerer will also key off).
+    """
+    env_id = (os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+    if env_id:
+        return env_id
+    os.makedirs(SESSIONS_DIR, mode=0o700, exist_ok=True)
+    import hashlib
+
+    cwd_key = hashlib.sha256(os.getcwd().encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(SESSIONS_DIR, cwd_key)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["session_id"]
+    except (OSError, ValueError, KeyError):
+        import uuid
+
+        sid = uuid.uuid4().hex
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"session_id": sid, "cwd": os.getcwd()}, fh)
+        return sid
+
+
+# --------------------------------------------------------------------------- pending-job state
+# The Stop hook (commander/maya_stop_gate.py) reads ~/.maya/pending/<session_id> to know whether to
+# re-arm a `maya discuss --poll` across turns (the 600s-cap survival). discuss writes it 'open' on
+# POST; --poll clears it when the job reaches a terminal state. Keyed by the SAME session id the hook
+# gets from Claude Code's stdin (CLAUDE_SESSION_ID, else the minted per-cwd id).
+PENDING_DIR = os.path.join(CONFIG_DIR, "pending")
+
+
+def _pending_path(session_id: str) -> str:
+    safe = "".join(c for c in (session_id or "") if c.isalnum() or c in "-_")[:128]
+    return os.path.join(PENDING_DIR, safe or "default")
+
+
+# CLIENT-SIDE RE-ARM CEILING (defense in depth, M3 audit): even if the server-side queued/calling
+# sweeps never run (scheduler stalled entirely), the loop must terminate. We stamp first_seen at POST
+# and self-expire the pending record after this wall-clock — so a wedged server can't make the hook
+# block forever. ~30 min matches the design's max re-poll wall-clock.
+PENDING_MAX_AGE_SECONDS = 30 * 60
+
+
+def _mark_pending(session_id: str, job_id: str) -> None:
+    os.makedirs(PENDING_DIR, mode=0o700, exist_ok=True)
+    with open(_pending_path(session_id), "w", encoding="utf-8") as fh:
+        json.dump({"job_id": job_id, "status": "open", "first_seen": time.time()}, fh)
+
+
+def _pending_expired(session_id: str) -> bool:
+    """True if the pending record is older than the re-arm ceiling (→ the poll should give up + clear).
+    Best-effort: a record without first_seen (legacy) or unreadable → treat as NOT expired (the server
+    sweeps remain the primary terminator); only a real, old first_seen forces local expiry."""
+    try:
+        with open(_pending_path(session_id), encoding="utf-8") as fh:
+            rec = json.load(fh)
+        first = rec.get("first_seen")
+        return isinstance(first, (int, float)) and (time.time() - first) > PENDING_MAX_AGE_SECONDS
+    except (OSError, ValueError):
+        return False
+
+
+def _clear_pending(session_id: str) -> None:
+    try:
+        os.remove(_pending_path(session_id))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- commands
+def cmd_pair(args: list[str]) -> int:
+    if not args:
+        print("usage: maya pair <code>", file=sys.stderr)
+        return 2
+    code = args[0].strip()
+    cfg = _load_config()
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "⚠️  ANTHROPIC_API_KEY is set in your environment. Path B requires your agent to bill via\n"
+            "    your subscription, NOT the API. Unset it (remove from your shell profile) before\n"
+            "    running coding agents, or commander runs will burn API credits.",
+            file=sys.stderr,
+        )
+    url = _cloud_url(cfg) + "/commander/pair"
+    status, body = _post(url, {"code": code})
+    if status == 200 and body.get("token"):
+        cfg["token"] = body["token"]
+        cfg["owner_caller_id"] = body.get("owner_caller_id", "")
+        cfg["cloud_url"] = _cloud_url(cfg)
+        _save_config(cfg)
+        print(f"✓ paired. machine bound to caller_id={cfg['owner_caller_id']}. config → {CONFIG_PATH}")
+        return 0
+    if status == 401:
+        print("✗ invalid or expired pairing code. Ask Maya for a fresh one on the call.", file=sys.stderr)
+    elif status == 404:
+        print("✗ commander is not enabled on the server.", file=sys.stderr)
+    elif status == 503:
+        print("✗ server can't complete pairing (no machine token configured).", file=sys.stderr)
+    else:
+        print(f"✗ pairing failed (status={status}): {body.get('error', '')}", file=sys.stderr)
+    return 1
+
+
+def _require_paired(cfg: dict) -> tuple[str, str] | None:
+    token = cfg.get("token")
+    caller_id = cfg.get("owner_caller_id")
+    if not token or not caller_id:
+        print("✗ this machine isn't paired. Run `maya pair <code>` first.", file=sys.stderr)
+        return None
+    return token, caller_id
+
+
+def cmd_discuss(args: list[str]) -> int:
+    cfg = _load_config()
+    paired = _require_paired(cfg)
+    if paired is None:
+        return 1
+    token, caller_id = paired
+    base = _cloud_url(cfg)
+
+    # --poll <job_id>: ONE bounded poll, then exit 0 either way (the 600s-cap-safe re-arm shape).
+    if args and args[0] == "--poll":
+        if len(args) < 2:
+            print("usage: maya discuss --poll <job_id>", file=sys.stderr)
+            return 2
+        job_id = args[1].strip()
+        sid = _session_id()
+        # CLIENT-SIDE CEILING (defense in depth): if this discussion has been pending past the wall-
+        # clock ceiling, give up locally even if the server never terminalized it (scheduler fully
+        # stalled). Clear pending so the Stop hook stops re-arming, and surface it honestly.
+        if _pending_expired(sid):
+            _clear_pending(sid)
+            _log_seam("cli-expired", job_id)
+            print("COMMANDER_EXPIRED: the discussion ran past the time limit; proceed using your own judgment.")
+            return 0
+        deadline = time.monotonic() + POLL_BUDGET_SECONDS
+        while True:
+            status, body = _get(f"{base}/commander/jobs/{job_id}", token=token)
+            if status == 200 and body.get("terminal"):
+                _clear_pending(sid)  # job is done → the Stop hook stops re-arming
+                _log_seam("cli-resolved", job_id)
+                # `or ''` guards an explicit JSON null (None.upper() / a null instruction would crash,
+                # breaking the exit-0 contract). body is always a dict (coerced in _get).
+                instr = body.get("resolved_instruction") or ""
+                st = body.get("status") or ""
+                if st == "resolved" and instr:
+                    print(instr)  # the authoritative instruction → the agent reads this as its directive
+                else:
+                    # no_answer / expired / failed / canceled — surface honestly, no fabricated directive.
+                    print(f"COMMANDER_{(st or 'unknown').upper()}: Maya could not reach you; proceed using your own judgment.")
+                return 0
+            if status == 404:
+                _clear_pending(sid)  # no such job → don't keep re-arming on a dead id
+                print("COMMANDER_UNKNOWN_JOB: no such job; proceed using your own judgment.", file=sys.stderr)
+                return 0
+            if time.monotonic() >= deadline:
+                _log_seam("cli-pending", job_id)
+                print(f"PENDING job_id={job_id} — still discussing. Re-poll next turn.")
+                return 0  # exit 0 with a sentinel → the Stop hook re-arms; never an error exit
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    # default: POST a thick brief, print job_id, exit fast (NON-BLOCKING).
+    brief = " ".join(args).strip()
+    if not brief:
+        print('usage: maya discuss "<brief>"   |   maya discuss --poll <job_id>', file=sys.stderr)
+        return 2
+    sid = _session_id()
+    status, body = _post(
+        f"{base}/commander/jobs",
+        {"brief": brief, "owner_caller_id": caller_id, "session_id": sid},
+        token=token,
+    )
+    if status == 202 and body.get("job_id"):
+        _mark_pending(sid, body["job_id"])  # the Stop hook re-arms --poll across turns until resolved
+        # session-id-source seam: 'env' = the harness exposed $CLAUDE_SESSION_ID (the hook's stdin id
+        # will match → the loop re-arms); 'minted' = we had to mint a per-cwd id (it will NOT match the
+        # hook's stdin id → the loop silently won't re-arm). trigger-rate reads this to distinguish
+        # id-divergence from low model-compliance.
+        _log_seam(
+            "session-id-source", body["job_id"],
+            extra=f"value={'env' if (os.environ.get('CLAUDE_SESSION_ID') or '').strip() else 'minted'}",
+        )
+        _log_seam("cli-posted", body["job_id"])
+        print(f"job_id={body['job_id']} — Maya will call you. Poll with: maya discuss --poll {body['job_id']}")
+        return 0
+    if status == 401:
+        print("✗ unauthorized — your pairing may have been revoked. Re-run `maya pair`.", file=sys.stderr)
+    elif status == 404:
+        print("✗ commander is not enabled on the server.", file=sys.stderr)
+    else:
+        print(f"✗ discuss failed (status={status}): {body.get('error', '')}", file=sys.stderr)
+    return 1
+
+
+def cmd_trigger_rate(args: list[str]) -> int:
+    """Tally the local seam log into the hook→CLI→resolve funnel — the M3 GO/NO-GO measurement.
+
+    Reads ~/.maya/commander.log (appended by the hook + CLI). The hook logs hook-blocked on EVERY
+    re-arm turn for the same job, so the raw count over-counts; we DEDUPE hook-blocked by job_id so the
+    denominator is "distinct discussions the hook nudged", making the rates meaningful (and never >100%):
+      * posted-rate   = cli-posted / DISTINCT(hook-blocked job_ids)  — did the model run `maya discuss`
+        for the jobs the hook nudged. (A model-compliance signal — but read with the session-id caveat.)
+      * resolved-rate = cli-resolved / cli-posted — did posted jobs reach a decision.
+    The session-id-source tally surfaces the silent-divergence failure mode: if many discusses used a
+    'minted' id (no $CLAUDE_SESSION_ID), a low posted-rate is an ID-PLUMBING problem, not low compliance.
+    """
+    counts = {"hook-blocked": 0, "cli-posted": 0, "cli-resolved": 0, "cli-pending": 0, "cli-expired": 0}
+    blocked_jobs: set[str] = set()
+    id_source = {"env": 0, "minted": 0}
+    try:
+        with open(SEAM_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                parts = dict(
+                    p.split("=", 1) for p in line.split() if "=" in p
+                )
+                seam = parts.get("seam", "")
+                if seam in counts:
+                    counts[seam] += 1
+                if seam == "hook-blocked":
+                    blocked_jobs.add(parts.get("job_id", ""))
+                if seam == "session-id-source":
+                    val = parts.get("value", "")
+                    if val in id_source:
+                        id_source[val] += 1
+    except OSError:
+        print("no seam log yet (~/.maya/commander.log). Run some discussions first.", file=sys.stderr)
+        return 1
+
+    distinct_blocked = len(blocked_jobs - {""})
+
+    def _rate(num, den):
+        return f"{(100 * num / den):.0f}%" if den else "n/a"
+
+    print("commander trigger-rate (from ~/.maya/commander.log):")
+    for k, v in counts.items():
+        print(f"  {k:16} {v}")
+    print(f"  distinct-blocked {distinct_blocked}  (hook-blocked deduped by job_id)")
+    print(f"  posted-rate      {_rate(counts['cli-posted'], distinct_blocked)}  (cli-posted / distinct hook-blocked jobs)")
+    print(f"  resolved-rate    {_rate(counts['cli-resolved'], counts['cli-posted'])}  (cli-resolved / cli-posted)")
+    if id_source["env"] or id_source["minted"]:
+        print(f"  session-id-source  env={id_source['env']} minted={id_source['minted']}  "
+              f"(if minted>0, $CLAUDE_SESSION_ID isn't reaching the CLI → the hook can't match; a low "
+              f"posted-rate may be id-divergence, not compliance)")
+    return 0
+
+
+USAGE = """maya — voice commander for your background coding agents
+
+  maya pair <code>            redeem the pairing code Maya gave you on the call
+  maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
+  maya discuss --poll <id>    one bounded poll for the resolved instruction
+  maya trigger-rate           tally the local seam log (the M3 GO/NO-GO measurement)
+"""
+
+
+def main(argv: list[str]) -> int:
+    _scrub_api_key()
+    if not argv:
+        print(USAGE)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "pair":
+        return cmd_pair(rest)
+    if cmd == "discuss":
+        return cmd_discuss(rest)
+    if cmd == "trigger-rate":
+        return cmd_trigger_rate(rest)
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    print(f"unknown command: {cmd}\n\n{USAGE}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
