@@ -41,6 +41,10 @@ mkdir -p "$BIN_DIR"
 fetch "maya" "$BIN_DIR/maya"
 chmod +x "$BIN_DIR/maya"
 
+echo "Installing the maya-connect skill -> $SKILLS_DIR/maya-connect"
+mkdir -p "$SKILLS_DIR/maya-connect"
+fetch "skills/maya-connect/SKILL.md" "$SKILLS_DIR/maya-connect/SKILL.md"
+
 echo "Installing the maya-discuss skill -> $SKILLS_DIR/maya-discuss"
 mkdir -p "$SKILLS_DIR/maya-discuss"
 fetch "skills/maya-discuss/SKILL.md" "$SKILLS_DIR/maya-discuss/SKILL.md"

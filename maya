@@ -388,12 +388,129 @@ def cmd_trigger_rate(args: list[str]) -> int:
     return 0
 
 
+def _machine_label() -> str:
+    import socket
+
+    try:
+        host = socket.gethostname()
+    except Exception:  # noqa: BLE001
+        host = "this-computer"
+    return f"{host}:{os.getcwd()}"[:200]
+
+
+CONNECT_POLL_BUDGET = 90      # one bounded poll, < the 600s Bash cap (mirrors discuss)
+CONNECT_POLL_INTERVAL = 3
+CONNECT_PENDING_PATH = os.path.join(CONFIG_DIR, "connect_pending")  # {pending_secret, code, expires_mono}
+
+
+def _save_connect_pending(rec: dict) -> None:
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(CONNECT_PENDING_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh)
+
+
+def _load_connect_pending() -> dict:
+    try:
+        with open(CONNECT_PENDING_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _clear_connect_pending() -> None:
+    try:
+        os.remove(CONNECT_PENDING_PATH)
+    except OSError:
+        pass
+
+
+def cmd_connect(args: list[str]) -> int:
+    """Connect this computer to Maya. `maya connect` mints a 6-digit code (shown here) + starts
+    waiting; you CALL Maya, pass your PIN, and READ HER the six digits. `maya connect --poll` does one
+    bounded poll for the binding (re-run / let the skill re-poll until it pairs)."""
+    cfg = _load_config()
+    base = _cloud_url(cfg)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "⚠️  ANTHROPIC_API_KEY is set — unset it so your agent bills via your subscription, not the API.",
+            file=sys.stderr,
+        )
+
+    # --poll: one bounded poll, authenticated by the 128-bit pending_secret (NEVER the 6 digits).
+    if args and args[0] == "--poll":
+        rec = _load_connect_pending()
+        secret = rec.get("pending_secret")
+        if not secret:
+            print("Nothing to connect — run `maya connect` first.", file=sys.stderr)
+            return 2
+        deadline = time.monotonic() + CONNECT_POLL_BUDGET
+        while True:
+            status, body = _get(f"{base}/commander/pair/status", token=secret)
+            st = body.get("status") if status == 200 else None
+            if status == 200 and st == "bound" and body.get("token"):
+                cfg["token"] = body["token"]
+                cfg["owner_caller_id"] = body.get("owner_caller_id", "")
+                cfg["cloud_url"] = base
+                _save_config(cfg)
+                _clear_connect_pending()
+                last4 = (cfg["owner_caller_id"] or "")[-4:]
+                print(f"✓ Connected! This computer is now linked to your Maya account (…{last4}).")
+                print("  Tip: when you're ready for Maya to auto-call on agent decisions, run `maya trigger-rate` then enable the hook.")
+                return 0
+            if status == 401 or st in ("burned",):
+                _clear_connect_pending()
+                print("✗ This pairing expired or was cancelled. Run `maya connect` again for a fresh code.", file=sys.stderr)
+                return 1
+            if status == 404:
+                print("✗ commander is not enabled on the server.", file=sys.stderr)
+                return 1
+            if time.monotonic() >= deadline:
+                code = rec.get("code", "??????")
+                print(f"PENDING — still waiting. Call Maya and read her: {_grouped(code)}  (re-poll continues)")
+                return 0  # exit 0 → the skill re-arms; never an error exit
+            time.sleep(CONNECT_POLL_INTERVAL)
+
+    # default: mint a code + show it + the call instructions.
+    status, body = _post(f"{base}/commander/connect", {"machine_label": _machine_label()})
+    if status == 202 and body.get("code") and body.get("pending_secret"):
+        code = body["code"]
+        _save_connect_pending({"pending_secret": body["pending_secret"], "code": code})
+        num = body.get("maya_number") or ""
+        print("\n  ┌─ Connect this computer to Maya ─────────────────────────")
+        print(f"  │  Your code:   {_grouped(code)}")
+        print(f"  │  Call Maya{(' at ' + num) if num else ''} and read her these six digits.")
+        if num:
+            print(f"  │  (tap to call: tel:{num})")
+        print("  │  This computer:  " + _machine_label())
+        print("  └─────────────────────────────────────────────────────────\n")
+        print(f"Then run:  maya connect --poll   (or the /maya-connect skill keeps polling until you're linked)")
+        return 0
+    if status == 429:
+        print("✗ too many pending connects from here — wait a minute and try again.", file=sys.stderr)
+    elif status == 404:
+        print("✗ commander is not enabled on the server.", file=sys.stderr)
+    else:
+        print(f"✗ connect failed (status={status}): {body.get('error', '')}", file=sys.stderr)
+    return 1
+
+
+def _grouped(code: str) -> str:
+    """Render a 6-digit code grouped for easy reading aloud: '429185' → '4 2 9  1 8 5'."""
+    d = "".join(ch for ch in (code or "") if ch.isdigit())
+    if len(d) == 6:
+        return f"{d[0]} {d[1]} {d[2]}   {d[3]} {d[4]} {d[5]}"
+    return code
+
+
 USAGE = """maya — voice commander for your background coding agents
 
-  maya pair <code>            redeem the pairing code Maya gave you on the call
+  maya connect                connect this computer to Maya (shows a 6-digit code to read her on a call)
+  maya connect --poll         one bounded poll until this computer is linked
   maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
   maya discuss --poll <id>    one bounded poll for the resolved instruction
-  maya trigger-rate           tally the local seam log (the M3 GO/NO-GO measurement)
+  maya trigger-rate           tally the local seam log (the GO/NO-GO measurement)
+  maya pair <code>            [legacy] redeem a long pairing code (fallback; prefer `maya connect`)
 """
 
 
@@ -403,6 +520,8 @@ def main(argv: list[str]) -> int:
         print(USAGE)
         return 2
     cmd, rest = argv[0], argv[1:]
+    if cmd == "connect":
+        return cmd_connect(rest)
     if cmd == "pair":
         return cmd_pair(rest)
     if cmd == "discuss":

@@ -46,7 +46,8 @@ maya pair <code-Maya-texted-you>
 ## Usage
 
 ```
-maya pair <code>            connect this machine (one-time; the code comes from a call with Maya)
+maya connect                connect this machine — shows a 6-digit code you read to Maya on a call (the easy way)
+maya pair <code>            [legacy] redeem a long code out-of-band (fallback)
 maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
 maya discuss --poll <id>    one bounded poll for the decision
 maya trigger-rate           how reliably the hook→discuss→resolve loop fired (the GO/NO-GO metric)
