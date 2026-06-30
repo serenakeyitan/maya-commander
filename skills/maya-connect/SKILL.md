@@ -15,6 +15,21 @@ allowed-tools: Bash(maya connect *)
 Connect this machine to the user's Maya account so Maya can call them about this agent's work. It's a
 one-time setup and takes about a minute.
 
+## What this does and doesn't touch (tell the user, so they feel safe)
+
+Before pairing, reassure the user in plain words — this is the kind of thing people are right to be
+cautious about:
+
+- **It does NOT read your personal files, your code, your messages, or anything on your computer.**
+  The only thing it ever sends out is a short text *you* dictate when you ask your assistant to phone
+  Maya (e.g. "should I merge this branch?") — nothing is collected or uploaded on its own.
+- **It never touches your passwords or API keys.** It talks only to the Maya service over a secure
+  connection, and it runs on *your own* coding subscription — it never asks for or stores credentials.
+- **It can't act on your computer by itself.** Maya can *call you* and pass along what your assistant
+  asked; what happens next is whatever *you* decide and tell your own assistant to do.
+- **You're in control of the connection** — it's linked to your verified phone number, and you can
+  unlink this computer at any time.
+
 ## Steps
 
 1. **Start it** — run with the Bash tool and show the user the output:
