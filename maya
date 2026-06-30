@@ -426,9 +426,10 @@ def _clear_connect_pending() -> None:
 
 
 def cmd_connect(args: list[str]) -> int:
-    """Connect this computer to Maya. `maya connect` mints a 6-digit code (shown here) + starts
-    waiting; you CALL Maya, pass your PIN, and READ HER the six digits. `maya connect --poll` does one
-    bounded poll for the binding (re-run / let the skill re-poll until it pairs)."""
+    """Connect this computer to Maya. `maya connect` mints a 6-digit code (shown here); you CALL Maya,
+    pass your PIN, and READ HER the six digits. `maya connect --wait` mints the code AND blocks until
+    the bind lands, so you never type a second command (this is what install.sh runs). `maya connect
+    --poll` does ONE bounded poll (for the /maya-connect skill to re-arm across turns)."""
     cfg = _load_config()
     base = _cloud_url(cfg)
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -472,10 +473,17 @@ def cmd_connect(args: list[str]) -> int:
             time.sleep(CONNECT_POLL_INTERVAL)
 
     # default: mint a code + show it + the call instructions.
+    # --wait: after minting, BLOCK and poll in-process until the bind lands (or the code expires), so
+    # the user never types a SECOND command. This is what install.sh runs at the end of the
+    # "easiest install" flow: one fuzzy sentence → agent runs install.sh → code prints → the SAME
+    # process waits → the moment the user reads the digits to Maya, it prints "Connected!". The plain
+    # `maya connect` (no --wait) stays non-blocking for the skill-driven path.
+    wait_mode = bool(args and args[0] == "--wait")
     status, body = _post(f"{base}/commander/connect", {"machine_label": _machine_label()})
     if status == 202 and body.get("code") and body.get("pending_secret"):
         code = body["code"]
-        _save_connect_pending({"pending_secret": body["pending_secret"], "code": code})
+        secret = body["pending_secret"]
+        _save_connect_pending({"pending_secret": secret, "code": code})
         num = body.get("maya_number") or ""
         print("\n  ┌─ Connect this computer to Maya ─────────────────────────")
         print(f"  │  Your code:   {_grouped(code)}")
@@ -484,8 +492,45 @@ def cmd_connect(args: list[str]) -> int:
             print(f"  │  (tap to call: tel:{num})")
         print("  │  This computer:  " + _machine_label())
         print("  └─────────────────────────────────────────────────────────\n")
-        print(f"Then run:  maya connect --poll   (or the /maya-connect skill keeps polling until you're linked)")
-        return 0
+        if not wait_mode:
+            print("Then run:  maya connect --poll   (or the /maya-connect skill keeps polling until you're linked)")
+            return 0
+        # --wait: poll in-process until bound/expired. Long budget here (the human has to dial + talk),
+        # so this is NOT CONNECT_POLL_BUDGET (the short skill budget) — give them a few minutes.
+        print("Waiting for you to read Maya the six digits above… (this window will say so when you're linked)")
+        ttl = body.get("ttl") or 180
+        deadline = time.monotonic() + min(int(ttl) + 30, 600)
+        try:
+            while True:
+                status, pbody = _get(f"{base}/commander/pair/status", token=secret)
+                st = pbody.get("status") if status == 200 else None
+                if status == 200 and st == "bound" and pbody.get("token"):
+                    cfg["token"] = pbody["token"]
+                    cfg["owner_caller_id"] = pbody.get("owner_caller_id", "")
+                    cfg["cloud_url"] = base
+                    _save_config(cfg)
+                    _clear_connect_pending()
+                    last4 = (cfg["owner_caller_id"] or "")[-4:]
+                    print(f"\n✓ Connected! This computer is now linked to your Maya account (…{last4}).")
+                    print("  That's it — you won't have to do this again. Your coding assistant can reach Maya from now on.")
+                    return 0
+                if status == 401 or st in ("burned",):
+                    _clear_connect_pending()
+                    print("\n✗ That code expired or was cancelled. Just run `maya connect --wait` again for a fresh one.", file=sys.stderr)
+                    return 1
+                if status == 404:
+                    print("\n✗ commander is not enabled on the server.", file=sys.stderr)
+                    return 1
+                if time.monotonic() >= deadline:
+                    print(f"\nStill waiting — the code may have expired. Run `maya connect --wait` again for a fresh one ({_grouped(code)} was the last).")
+                    return 0  # exit 0: not an error, the user can just re-run
+                time.sleep(CONNECT_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            # The user hit Ctrl-C (or hung up and closed the window). Don't dump a traceback — the
+            # pending code is still saved, so tell them how to resume with no data lost.
+            print(f"\nStopped waiting. Your code {_grouped(code)} is still good for a bit — read it to Maya,")
+            print("then run `maya connect --poll` to finish, or `maya connect --wait` for a fresh code.")
+            return 0
     if status == 429:
         print("✗ too many pending connects from here — wait a minute and try again.", file=sys.stderr)
     elif status == 404:
