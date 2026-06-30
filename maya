@@ -528,14 +528,19 @@ def cmd_connect(args: list[str]) -> int:
     # `maya connect` (no --wait) stays non-blocking for the skill-driven path.
     wait_mode = bool(args and args[0] == "--wait")
     status, body = _post(f"{base}/commander/connect", {"machine_label": _machine_label()})
-    if status == 202 and body.get("code") and body.get("pending_secret"):
-        code = body["code"]
+    if status == 202 and body.get("pending_secret"):
+        code = body.get("code", "")
         secret = body["pending_secret"]
         _save_connect_pending({"pending_secret": secret, "code": code})
         num = body.get("maya_number") or ""
+        # ASR-FREE pairing: ARM this row over HTTP so Maya can read the FINGERPRINT back for a yes/no.
+        # (No more reading 6 digits aloud — voice mis-heard them.) The fingerprint is what's shown big.
+        astat, abody = _post(f"{base}/commander/pair/arm", {}, token=secret)
+        fp = (abody.get("fingerprint") if astat == 200 else "") or body.get("fingerprint") or ""
         print("\n  ┌─ Connect this computer to Maya ─────────────────────────")
-        print(f"  │  Your code:   {_grouped(code)}")
-        print(f"  │  Call Maya{(' at ' + num) if num else ''} and read her these six digits.")
+        print(f"  │  Fingerprint:  {fp}")
+        print(f"  │  Call Maya{(' at ' + num) if num else ''} and say \"connect my computer.\"")
+        print(f"  │  She'll read back this fingerprint — say YES if it matches.")
         if num:
             print(f"  │  (tap to call: tel:{num})")
         print("  │  This computer:  " + _machine_label())
@@ -545,20 +550,17 @@ def cmd_connect(args: list[str]) -> int:
             return 0
         # --wait: poll in-process until bound/expired. Long budget here (the human has to dial + talk),
         # so this is NOT CONNECT_POLL_BUDGET (the short skill budget) — give them a few minutes.
-        print("Waiting for you to read Maya the six digits above… (this window will say so when you're linked)")
+        print("Waiting for you to confirm the fingerprint with Maya… (this window will say so when you're linked)")
         ttl = body.get("ttl") or 180
         deadline = time.monotonic() + min(int(ttl) + 30, 600)
         try:
+            _last_arm = time.monotonic()
             while True:
                 status, pbody = _get(f"{base}/commander/pair/status", token=secret)
                 st = pbody.get("status") if status == 200 else None
                 if status == 200 and st == "bound" and pbody.get("token"):
                     rc = _finish_pairing(cfg, base, secret, pbody)  # save → ack → clear (idempotent)
                     return rc
-                if status == 200 and st == "burned":
-                    _clear_connect_pending()
-                    print("\n✗ Too many wrong reads — that code is burned. Run `maya connect --wait` again for a fresh one.", file=sys.stderr)
-                    return 1
                 if status == 404:
                     print("\n✗ commander is not enabled on the server.", file=sys.stderr)
                     return 1
@@ -567,14 +569,19 @@ def cmd_connect(args: list[str]) -> int:
                     print("\n✗ That pairing is no longer active. Just run `maya connect --wait` again for a fresh one.", file=sys.stderr)
                     return 1
                 if time.monotonic() >= deadline:
-                    print(f"\nStill waiting — the code may have expired. Run `maya connect --wait` again for a fresh one ({_grouped(code)} was the last).")
+                    print(f"\nStill waiting — the pairing may have expired. Run `maya connect --wait` again for a fresh one (fingerprint {fp}).")
                     return 0  # exit 0: not an error, the user can just re-run
+                # Keep the row ARMED through a long call: the server auto-reverts armed→pending after a
+                # short TTL, so re-arm periodically while we wait (cheap; idempotent).
+                if time.monotonic() - _last_arm > 45:
+                    _post(f"{base}/commander/pair/arm", {}, token=secret)
+                    _last_arm = time.monotonic()
                 time.sleep(CONNECT_POLL_INTERVAL)
         except KeyboardInterrupt:
             # The user hit Ctrl-C (or hung up and closed the window). Don't dump a traceback — the
-            # pending code is still saved, so tell them how to resume with no data lost.
-            print(f"\nStopped waiting. Your code {_grouped(code)} is still good for a bit — read it to Maya,")
-            print("then run `maya connect --poll` to finish, or `maya connect --wait` for a fresh code.")
+            # pending secret is still saved, so tell them how to resume with no data lost.
+            print(f"\nStopped waiting. Fingerprint {fp} is still good for a bit — confirm it with Maya,")
+            print("then run `maya connect --poll` to finish, or `maya connect --wait` to start fresh.")
             return 0
     if status == 429:
         print("✗ too many pending connects from here — wait a minute and try again.", file=sys.stderr)
