@@ -81,16 +81,66 @@ def _load_config() -> dict:
         return {}
 
 
+def _atomic_write_0600(path: str, data: str) -> None:
+    """Durably write `data` to `path` with 0600 perms, atomically: write a temp file in the same dir,
+    fsync it, then os.replace (atomic rename) onto the target, then fsync the dir. A crash mid-write
+    leaves EITHER the old file or the new one — never a truncated/empty file. (Fixes the token-delivery
+    bug's amplifier: a non-atomic O_TRUNC write could leave a zero-byte config.json after a 'successful'
+    200, so the machine thought it saved the token but didn't.)"""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)  # atomic on POSIX
+        try:
+            dfd = os.open(os.path.dirname(path), os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass  # dir fsync is best-effort (not all FS support it)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _save_config(cfg: dict) -> None:
-    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-    # Create 0600 ATOMICALLY (os.open with the mode), not open()+chmod — a plain open() honors the
-    # umask (commonly 0644) and the bearer token would be briefly world-readable on a shared machine
-    # before the chmod (a TOCTOU window). O_CREAT|O_TRUNC with mode 0o600 closes that window; the
-    # mode only applies on creation, so re-saving an existing 0600 file keeps it 0600.
-    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh)
-    os.chmod(CONFIG_PATH, 0o600)  # belt-and-suspenders: also tighten a pre-existing looser file
+    _atomic_write_0600(CONFIG_PATH, json.dumps(cfg))
+
+
+def _ack_pairing(base: str, secret: str) -> None:
+    """Tell the server we've durably saved the token so it can consume the bound row (confirm-then-
+    consume). Best-effort: if it fails, the row survives a grace window and a later poll re-delivers +
+    re-acks, so a missed ack never loses the token — it just leaves the row to be reaped after grace."""
+    try:
+        _post(f"{base}/commander/pair/ack", {}, token=secret)
+    except Exception:  # noqa: BLE001 — never fail the pairing on the ack; grace-TTL + re-poll cover it
+        pass
+
+
+def _finish_pairing(cfg: dict, base: str, secret: str, body: dict) -> int:
+    """Shared success path for --poll and --wait: durably SAVE the token FIRST, then ACK the server (so
+    it consumes the row), then clear connect_pending. Order matters: save-before-ack-before-clear means
+    a crash at any point leaves a recoverable state (the secret + bound row both still exist until we've
+    proven the token is on disk)."""
+    cfg["token"] = body["token"]
+    cfg["owner_caller_id"] = body.get("owner_caller_id", "")
+    cfg["cloud_url"] = base
+    _save_config(cfg)            # 1. durably persist the token (atomic)
+    _ack_pairing(base, secret)   # 2. now safe to let the server consume the bound row
+    _clear_connect_pending()     # 3. and drop the local pending record
+    last4 = (cfg["owner_caller_id"] or "")[-4:]
+    print(f"✓ Connected! This computer is now linked to your Maya account (…{last4}).")
+    print("  Tip: when you're ready for Maya to auto-call on agent decisions, run `maya trigger-rate` then enable the hook.")
+    return 0
 
 
 def _cloud_url(cfg: dict) -> str:
@@ -404,10 +454,7 @@ CONNECT_PENDING_PATH = os.path.join(CONFIG_DIR, "connect_pending")  # {pending_s
 
 
 def _save_connect_pending(rec: dict) -> None:
-    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-    fd = os.open(CONNECT_PENDING_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(rec, fh)
+    _atomic_write_0600(CONNECT_PENDING_PATH, json.dumps(rec))  # atomic: never a torn pending file
 
 
 def _load_connect_pending() -> dict:
@@ -450,21 +497,22 @@ def cmd_connect(args: list[str]) -> int:
             status, body = _get(f"{base}/commander/pair/status", token=secret)
             st = body.get("status") if status == 200 else None
             if status == 200 and st == "bound" and body.get("token"):
-                cfg["token"] = body["token"]
-                cfg["owner_caller_id"] = body.get("owner_caller_id", "")
-                cfg["cloud_url"] = base
-                _save_config(cfg)
-                _clear_connect_pending()
-                last4 = (cfg["owner_caller_id"] or "")[-4:]
-                print(f"✓ Connected! This computer is now linked to your Maya account (…{last4}).")
-                print("  Tip: when you're ready for Maya to auto-call on agent decisions, run `maya trigger-rate` then enable the hook.")
-                return 0
-            if status == 401 or st in ("burned",):
-                _clear_connect_pending()
-                print("✗ This pairing expired or was cancelled. Run `maya connect` again for a fresh code.", file=sys.stderr)
+                return _finish_pairing(cfg, base, secret, body)  # save → ack → clear (idempotent)
+            if status == 200 and st == "burned":
+                _clear_connect_pending()  # terminal: the SERVER said burned → safe to drop the secret
+                print("✗ Too many wrong reads — that code is burned. Run `maya connect` again for a fresh code.", file=sys.stderr)
                 return 1
             if status == 404:
                 print("✗ commander is not enabled on the server.", file=sys.stderr)
+                return 1
+            if status == 401:
+                # 401 = the server doesn't recognize this secret. With confirm-then-consume the bound
+                # row survives until WE ack it, so a 401 here usually means the row was reaped after the
+                # grace window (we waited too long) — NOT that the token was silently lost. Do NOT
+                # discard the pending file blindly; tell the user to re-mint. (The audit's phantom-
+                # pairing amplifier was clearing the still-valid secret on a transient 401.)
+                _clear_connect_pending()
+                print("✗ This pairing is no longer active. Run `maya connect` again for a fresh code.", file=sys.stderr)
                 return 1
             if time.monotonic() >= deadline:
                 code = rec.get("code", "??????")
@@ -505,21 +553,18 @@ def cmd_connect(args: list[str]) -> int:
                 status, pbody = _get(f"{base}/commander/pair/status", token=secret)
                 st = pbody.get("status") if status == 200 else None
                 if status == 200 and st == "bound" and pbody.get("token"):
-                    cfg["token"] = pbody["token"]
-                    cfg["owner_caller_id"] = pbody.get("owner_caller_id", "")
-                    cfg["cloud_url"] = base
-                    _save_config(cfg)
+                    rc = _finish_pairing(cfg, base, secret, pbody)  # save → ack → clear (idempotent)
+                    return rc
+                if status == 200 and st == "burned":
                     _clear_connect_pending()
-                    last4 = (cfg["owner_caller_id"] or "")[-4:]
-                    print(f"\n✓ Connected! This computer is now linked to your Maya account (…{last4}).")
-                    print("  That's it — you won't have to do this again. Your coding assistant can reach Maya from now on.")
-                    return 0
-                if status == 401 or st in ("burned",):
-                    _clear_connect_pending()
-                    print("\n✗ That code expired or was cancelled. Just run `maya connect --wait` again for a fresh one.", file=sys.stderr)
+                    print("\n✗ Too many wrong reads — that code is burned. Run `maya connect --wait` again for a fresh one.", file=sys.stderr)
                     return 1
                 if status == 404:
                     print("\n✗ commander is not enabled on the server.", file=sys.stderr)
+                    return 1
+                if status == 401:
+                    _clear_connect_pending()
+                    print("\n✗ That pairing is no longer active. Just run `maya connect --wait` again for a fresh one.", file=sys.stderr)
                     return 1
                 if time.monotonic() >= deadline:
                     print(f"\nStill waiting — the code may have expired. Run `maya connect --wait` again for a fresh one ({_grouped(code)} was the last).")
