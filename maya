@@ -548,7 +548,7 @@ def cmd_connect(args: list[str]) -> int:
     # --wait: after minting, BLOCK and poll in-process until the bind lands (or the code expires), so
     # the user never types a SECOND command. This is what install.sh runs at the end of the
     # "easiest install" flow: one fuzzy sentence → agent runs install.sh → code prints → the SAME
-    # process waits → the moment the user reads the digits to Maya, it prints "Connected!". The plain
+    # process waits → the moment the user types the digits on their keypad, it prints "Connected!". Plain
     # `maya connect` (no --wait) stays non-blocking for the skill-driven path.
     wait_mode = bool(args and args[0] == "--wait")
     status, body = _post(f"{base}/commander/connect", {"machine_label": _machine_label()})

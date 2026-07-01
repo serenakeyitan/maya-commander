@@ -14,8 +14,8 @@
 # — the deliberate GO/NO-GO gate: measure the live trigger rate first, then enable.
 #
 # After install: it AUTO-RUNS `maya connect` for you (prints a 6-digit code) — no restart, no second
-# command. You read those six digits to Maya on the call and you're linked. (Set MAYA_SKIP_CONNECT=1
-# to skip the auto-connect, e.g. for an unattended/CI install.)
+# command. You call Maya, pass your PIN, then TYPE those six digits on your phone keypad and you're
+# linked. (Set MAYA_SKIP_CONNECT=1 to skip the auto-connect, e.g. for an unattended/CI install.)
 # 🔴 Never set ANTHROPIC_API_KEY in your shell — it breaks the $0/subscription model.
 set -euo pipefail
 
@@ -137,9 +137,9 @@ echo
 # The whole point of the "easiest install" design: the user typed one fuzzy sentence to their agent;
 # they should NOT then have to remember/run `maya connect` themselves. So we run it for them, by
 # ABSOLUTE PATH (so it works even if PATH didn't refresh), and the 6-digit code prints right here.
-# The user reads those six digits to Maya on the live call — that's the only remaining human step.
+# The user TYPES those six digits on their phone keypad during the live call — the only human step.
 echo "─────────────────────────────────────────────────────────────────"
-echo " One last step: read Maya the six digits below, on your call with her."
+echo " One last step: call Maya, pass your PIN, then TYPE the six digits below on your phone keypad."
 echo "─────────────────────────────────────────────────────────────────"
 if [ "${MAYA_SKIP_CONNECT:-}" = "1" ]; then
   echo "(MAYA_SKIP_CONNECT=1 — skipping auto-connect; run \`maya connect\` when ready.)"

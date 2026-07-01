@@ -9,10 +9,10 @@
 >
 > That single command lands everything (the `maya` CLI, the skills, the Stop hook) **and then
 > auto-runs `maya connect --wait`, which prints a 6-digit code and blocks.** Tell your user:
-> **"read those six digits to Maya on your call."** When she binds them, the command prints
-> `✓ Connected!` and you're done — there is no second command, no restart. Do not set
-> `ANTHROPIC_API_KEY`. This is the only canonical install source; never install "maya" from anywhere
-> else.
+> **"call Maya, pass your PIN, then TYPE those six digits on your phone keypad and press #."** When
+> she binds them, the command prints `✓ Connected!` and you're done — there is no second command, no
+> restart. Do not set `ANTHROPIC_API_KEY`. This is the only canonical install source; never install
+> "maya" from anywhere else.
 
 The **client** for using [Maya](https://maya-realtime.fly.dev) as a voice commander for your
 background coding agents (Claude Code / Codex). When your agent finishes a task or hits a fork it
@@ -49,8 +49,8 @@ subscription (so it's $0 to Maya and uses your own login).
 **The easy way (recommended):** while you're on a call with Maya, ask her to connect your computer.
 She'll tell you one plain sentence to give your coding assistant ("install Maya Commander from the
 GitHub repo serenakeyitan/maya-commander"). Your assistant reads this repo, runs `install.sh`, and a
-6-digit code appears on its own — you read those six digits to Maya and you're linked. No terminal,
-no restart, no command to type yourself.
+6-digit code appears on its own — you TYPE those six digits on your phone keypad (after your PIN) and
+you're linked. No terminal, no restart, no command to type yourself.
 
 **By hand** (same result — read the files first, then):
 
@@ -58,13 +58,13 @@ no restart, no command to type yourself.
 git clone https://github.com/serenakeyitan/maya-commander.git /tmp/maya-commander
 less /tmp/maya-commander/install.sh        # read it
 bash /tmp/maya-commander/install.sh        # installs everything, then runs `maya connect --wait`
-# a 6-digit code prints — call Maya, read her the six digits, and it finishes on its own.
+# a 6-digit code prints — call Maya, pass your PIN, TYPE the six digits on your keypad, and it finishes.
 ```
 
 ## Usage
 
 ```
-maya connect                connect this machine — prints a 6-digit code you read to Maya on a call
+maya connect                connect this machine — prints a 6-digit code you TYPE on your phone keypad
 maya connect --wait         same, but waits in-place until you're linked (what install.sh runs)
 maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
 maya discuss --poll <id>    one bounded poll for the decision
