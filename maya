@@ -539,9 +539,20 @@ def cmd_connect(args: list[str]) -> int:
                 print("✗ This pairing is no longer active. Run `maya connect` again for a fresh code.", file=sys.stderr)
                 return 1
             if time.monotonic() >= deadline:
-                code = rec.get("code", "")
-                print(f"PENDING — still waiting. Call Maya, pass your PIN, then type on your keypad: {_grouped(code)}  (re-poll continues)")
-                return 0  # exit 0 → the skill re-arms; never an error exit
+                # Poll window elapsed with no bind → EXPIRE this code (owner directive). A code that was
+                # never typed must NOT linger: otherwise a fresh `maya connect` mints a NEW on-screen code
+                # while this old one is still 'pending' server-side, and the user can end up typing a code
+                # that no longer matches the bindable row — the code-drift 'no-match' trap. Expiring here
+                # keeps ONE truth: the code on screen is always the only live one. Authenticated by the
+                # 128-bit pending_secret (never the 6 digits); best-effort — clear locally regardless.
+                try:
+                    _post(f"{base}/commander/pair/expire", {}, token=secret)
+                except Exception:  # noqa: BLE001 — expiry is best-effort; the server TTL is the backstop
+                    pass
+                _clear_connect_pending()
+                print("⌛ Pairing timed out — that code has expired. Run `maya connect` again for a fresh "
+                      "code, then call Maya and type it right away.", file=sys.stderr)
+                return 1  # non-zero: this code is dead; the skill should mint a fresh one, not re-poll it
             time.sleep(CONNECT_POLL_INTERVAL)
 
     # default: mint a code + show it + the call instructions.
