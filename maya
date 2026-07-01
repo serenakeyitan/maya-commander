@@ -43,6 +43,8 @@ DEFAULT_CLOUD_URL = "https://maya-realtime.fly.dev"
 POLL_BUDGET_SECONDS = 60
 POLL_INTERVAL_SECONDS = 3
 POST_TIMEOUT_SECONDS = 10
+WATCH_BUDGET_SECONDS = 90     # `maya calls --watch`: one bounded live-poll window, < the 600s Bash cap
+WATCH_POLL_INTERVAL = 3
 
 
 SEAM_LOG = os.path.join(CONFIG_DIR, "commander.log")
@@ -616,14 +618,90 @@ def _fmt_dur(started_at: str) -> str:
         return "?"
 
 
+def _print_call_log(body: dict) -> None:
+    """Render a tiered call-log payload. VERBATIM tier → the turns; SUMMARY tier → summary + metadata
+    ONLY (a relay stranger's verbatim never reaches the CLI — it's stripped cloud-side)."""
+    tier = body.get("tier")
+    md = body.get("metadata") or {}
+    if tier == "verbatim":
+        turns = body.get("turns") or []
+        if not turns:
+            print("(no transcript yet)")
+        for t in turns:
+            who = "you" if t.get("role") == "user" else "maya"
+            print(f"  {who}: {t.get('content', '')}")
+    else:  # summary tier — relay leg to a stranger: metadata + bounded summary, NEVER verbatim
+        print("  [relay leg — showing summary + metadata only; the other party's words aren't stored]")
+        for k in ("to", "mode", "answered_by", "live_status", "disposition", "callee_turn_count", "started_at"):
+            if md.get(k) not in (None, ""):
+                print(f"  {k:<16} {md[k]}")
+        if body.get("summary"):
+            print(f"  summary          {body['summary']}")
+
+
+def _fetch_log(base: str, token: str, caller_id: str, sid: str) -> tuple[int, dict]:
+    q = urllib.parse.quote(caller_id, safe="")
+    s = urllib.parse.quote(sid, safe="")
+    return _get(f"{base}/commander/calls/{s}/log?owner_caller_id={q}", token=token)
+
+
 def cmd_calls(args: list[str]) -> int:
-    """List the owner's IN-PROGRESS calls (stop a runaway call without digging in the Twilio Console)."""
+    """List in-progress calls; `--log <sid>` shows a call's content; `--watch <sid>` polls it live.
+    Content is TIERED cloud-side (no-leak): your own legs verbatim, a relay stranger summary-only."""
     cfg = _load_config()
     paired = _require_paired(cfg)
     if paired is None:
         return 1
     token, caller_id = paired
     base = _cloud_url(cfg)
+
+    # --log <sid>: one-shot content read (tiered cloud-side).
+    if args and args[0] == "--log":
+        if len(args) < 2:
+            print("usage: maya calls --log <sid>", file=sys.stderr)
+            return 2
+        st, body = _fetch_log(base, token, caller_id, args[1].strip())
+        if st == 404:
+            print("✗ no such call of yours.", file=sys.stderr)
+            return 1
+        if st == 403:
+            print("✗ this machine isn't paired on the server.", file=sys.stderr)
+            return 1
+        if st != 200:
+            print(f"✗ couldn't read the log (status={st}): {body.get('error', '')}", file=sys.stderr)
+            return 1
+        _print_call_log(body)
+        return 0
+
+    # --watch <sid>: bounded live poll (re-print the content as it grows; stop when the call ends).
+    if args and args[0] == "--watch":
+        if len(args) < 2:
+            print("usage: maya calls --watch <sid>", file=sys.stderr)
+            return 2
+        sid = args[1].strip()
+        deadline = time.monotonic() + WATCH_BUDGET_SECONDS
+        last = None
+        while True:
+            st, body = _fetch_log(base, token, caller_id, sid)
+            if st == 404:
+                print("(call ended or not found)")
+                return 0
+            if st != 200:
+                print(f"✗ watch failed (status={st}).", file=sys.stderr)
+                return 1
+            snap = (body.get("turns"), body.get("summary"), (body.get("metadata") or {}).get("live_status"))
+            if snap != last:
+                print(f"--- {(body.get('metadata') or {}).get('live_status') or body.get('tier')} ---")
+                _print_call_log(body)
+                last = snap
+            # A terminal disposition means the call ended → stop watching.
+            if (body.get("metadata") or {}).get("disposition"):
+                return 0
+            if time.monotonic() >= deadline:
+                print("(watch window ended; re-run to keep watching)")
+                return 0
+            time.sleep(WATCH_POLL_INTERVAL)
+
     q = urllib.parse.quote(caller_id, safe="")
     status, body = _get(f"{base}/commander/calls?owner_caller_id={q}", token=token)
     if status == 404:
@@ -697,6 +775,8 @@ USAGE = """maya — voice commander for your background coding agents
   maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
   maya discuss --poll <id>    one bounded poll for the resolved instruction
   maya calls                  list your in-progress calls (SID, to, status, duration)
+  maya calls --log <sid>      show a call's content (your own legs verbatim; a relay = summary only)
+  maya calls --watch <sid>    watch a call's content live (same no-leak tiering)
   maya hangup <sid>           hang up one call by SID
   maya hangup --all           hang up every in-progress call you have
   maya trigger-rate           tally the local seam log (the GO/NO-GO measurement)
