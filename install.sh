@@ -46,6 +46,8 @@ CLI_SRC="$(_find "the maya CLI" "$HERE/maya" "$REPO/scripts/maya")"
 HOOK_SRC="$(_find "the Stop hook" "$HERE/maya_stop_gate.py" "$REPO/commander/maya_stop_gate.py")"
 CONNECT_SKILL_SRC="$(_find "the maya-connect skill" "$HERE/skills/maya-connect/SKILL.md" "$HERE/maya-connect/SKILL.md")"
 DISCUSS_SKILL_SRC="$(_find "the maya-discuss skill" "$HERE/skills/maya-discuss/SKILL.md" "$HERE/maya-discuss/SKILL.md")"
+OFF_SKILL_SRC="$(_find "the maya-off skill" "$HERE/skills/maya-off/SKILL.md" "$HERE/maya-off/SKILL.md")"
+ON_SKILL_SRC="$(_find "the maya-on skill" "$HERE/skills/maya-on/SKILL.md" "$HERE/maya-on/SKILL.md")"
 
 echo "Installing the maya CLI → $BIN_DIR/maya"
 mkdir -p "$BIN_DIR"
@@ -59,6 +61,14 @@ cp "$CONNECT_SKILL_SRC" "$SKILLS_DIR/maya-connect/SKILL.md"
 echo "Installing the maya-discuss skill → $SKILLS_DIR/maya-discuss"
 mkdir -p "$SKILLS_DIR/maya-discuss"
 cp "$DISCUSS_SKILL_SRC" "$SKILLS_DIR/maya-discuss/SKILL.md"
+
+echo "Installing the maya-off skill → $SKILLS_DIR/maya-off"
+mkdir -p "$SKILLS_DIR/maya-off"
+cp "$OFF_SKILL_SRC" "$SKILLS_DIR/maya-off/SKILL.md"
+
+echo "Installing the maya-on skill → $SKILLS_DIR/maya-on"
+mkdir -p "$SKILLS_DIR/maya-on"
+cp "$ON_SKILL_SRC" "$SKILLS_DIR/maya-on/SKILL.md"
 
 echo "Installing the Stop hook → $HOOKS_DIR/maya_stop_gate.py"
 mkdir -p "$HOOKS_DIR"

@@ -36,6 +36,10 @@ import urllib.request
 CONFIG_DIR = os.path.expanduser("~/.maya")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
+# The AUTO-CALL flag: when this file EXISTS, the Stop hook may auto-dial Maya on a bg agent's
+# pending question. `maya off` removes it, `maya on` creates it. Toggling it NEVER touches the
+# pairing/connection (CONFIG_PATH) — off just makes the hook dormant; the machine stays linked.
+HOOK_ENABLED_PATH = os.path.join(CONFIG_DIR, "commander_hook_enabled")
 DEFAULT_CLOUD_URL = "https://maya-realtime.fly.dev"
 
 # Per-poll budget well under the 600s Bash hard cap (the audit's adjudicated ~60s, not 300s): each
@@ -831,6 +835,55 @@ def cmd_hangup(args: list[str]) -> int:
     return 0 if _hang(args[0].strip()) else 1
 
 
+def _autocall_enabled() -> bool:
+    return os.path.exists(HOOK_ENABLED_PATH)
+
+
+def cmd_off(_args: list[str]) -> int:
+    """Turn OFF auto-call (the Stop hook goes dormant). Keeps the connection — the machine stays paired;
+    manual `maya discuss` still works. Idempotent."""
+    try:
+        os.remove(HOOK_ENABLED_PATH)
+    except FileNotFoundError:
+        pass  # already off — idempotent
+    except OSError as exc:
+        print(f"✗ couldn't turn auto-call off ({type(exc).__name__}).", file=sys.stderr)
+        return 1
+    paired = os.path.exists(CONFIG_PATH)
+    print("✓ Auto-call is OFF. Maya will NOT call you automatically.")
+    print("  Still connected" + (" (paired)" if paired else "") +
+          " — manual `maya discuss \"<question>\"` still works. Re-enable with `maya on`.")
+    return 0
+
+
+def cmd_on(_args: list[str]) -> int:
+    """Turn ON auto-call: the Stop hook may auto-dial Maya when a bg agent finishes/forks with a
+    pending question. Requires the machine to be paired (a real token) — otherwise the hook can't call.
+    Idempotent."""
+    if not os.path.exists(CONFIG_PATH):
+        print("✗ Not connected yet — run `maya connect` first (auto-call needs a paired machine).",
+              file=sys.stderr)
+        return 1
+    try:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        with open(HOOK_ENABLED_PATH, "w", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        print(f"✗ couldn't turn auto-call on ({type(exc).__name__}).", file=sys.stderr)
+        return 1
+    print("✓ Auto-call is ON. Maya will call you when a background agent finishes or gets stuck.")
+    print("  Turn it off anytime with `maya off` (keeps the connection).")
+    return 0
+
+
+def cmd_status(_args: list[str]) -> int:
+    """Show whether the machine is connected + whether auto-call is on."""
+    paired = os.path.exists(CONFIG_PATH)
+    print(f"  connection : {'linked (paired)' if paired else 'NOT connected — run `maya connect`'}")
+    print(f"  auto-call  : {'ON  — Maya may call automatically' if _autocall_enabled() else 'OFF — manual `maya discuss` only'}")
+    return 0
+
+
 USAGE = """maya — voice commander for your background coding agents
 
   maya connect                connect this computer to Maya (shows a code to TYPE on your phone keypad)
@@ -843,6 +896,9 @@ USAGE = """maya — voice commander for your background coding agents
   maya hangup <sid>           hang up one call by SID
   maya hangup --all           hang up every in-progress call you have
   maya trigger-rate           tally the local seam log (the GO/NO-GO measurement)
+  maya on                     turn ON auto-call (Maya calls when a bg agent finishes/forks)
+  maya off                    turn OFF auto-call (keeps the connection; manual discuss still works)
+  maya status                 show connection + auto-call state
   maya pair <code>            [legacy] redeem a long pairing code (fallback; prefer `maya connect`)
 """
 
@@ -865,6 +921,12 @@ def main(argv: list[str]) -> int:
         return cmd_hangup(rest)
     if cmd == "trigger-rate":
         return cmd_trigger_rate(rest)
+    if cmd == "off":
+        return cmd_off(rest)
+    if cmd == "on":
+        return cmd_on(rest)
+    if cmd == "status":
+        return cmd_status(rest)
     if cmd in ("-h", "--help", "help"):
         print(USAGE)
         return 0
