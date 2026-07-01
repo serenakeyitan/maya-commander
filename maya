@@ -192,13 +192,33 @@ def _get(url: str, *, token: str | None = None, timeout: int = POST_TIMEOUT_SECO
 
 
 # --------------------------------------------------------------------------- session id
+# Claude Code exposes the session id as CLAUDE_CODE_SESSION_ID (verified: it equals the same
+# session_id the Stop hook receives on stdin). Older/other harnesses may use CLAUDE_SESSION_ID, so we
+# accept it as a fallback. This ONE helper is the single source of truth — both _session_id() (which
+# names the pending file the hook reads) and the session-id-source seam read from it, so they can never
+# drift apart again. (The original bug: the CLI read CLAUDE_SESSION_ID, which is never set, so it always
+# minted a per-cwd UUID while the hook keyed off the real id → the re-arm loop silently never matched.)
+_HARNESS_SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+
+
+def _harness_session_id() -> str:
+    """The session id the HARNESS exposes (== the hook's stdin session_id), or '' if none is set."""
+    for var in _HARNESS_SESSION_ENV_VARS:
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def _session_id() -> str:
     """The originating session's stable id so the Stop hook can re-poll the right job across turns.
 
-    Prefer the harness-exposed CLAUDE_SESSION_ID; else mint+persist our own UUID under ~/.maya/sessions
-    keyed by cwd (the per-cwd lock file the phase-2 round-trip answerer will also key off).
+    Prefer the harness-exposed session id (CLAUDE_CODE_SESSION_ID); else mint+persist our own UUID under
+    ~/.maya/sessions keyed by cwd (the per-cwd lock file the phase-2 round-trip answerer will also key
+    off). A minted id will NOT match the hook's stdin id, so the re-arm loop only works when the harness
+    exposes a session id — the `maya trigger-rate` session-id-source tally surfaces that.
     """
-    env_id = (os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+    env_id = _harness_session_id()
     if env_id:
         return env_id
     os.makedirs(SESSIONS_DIR, mode=0o700, exist_ok=True)
@@ -222,7 +242,7 @@ def _session_id() -> str:
 # The Stop hook (commander/maya_stop_gate.py) reads ~/.maya/pending/<session_id> to know whether to
 # re-arm a `maya discuss --poll` across turns (the 600s-cap survival). discuss writes it 'open' on
 # POST; --poll clears it when the job reaches a terminal state. Keyed by the SAME session id the hook
-# gets from Claude Code's stdin (CLAUDE_SESSION_ID, else the minted per-cwd id).
+# gets from Claude Code's stdin (CLAUDE_CODE_SESSION_ID, else the minted per-cwd id).
 PENDING_DIR = os.path.join(CONFIG_DIR, "pending")
 
 
@@ -369,13 +389,13 @@ def cmd_discuss(args: list[str]) -> int:
     )
     if status == 202 and body.get("job_id"):
         _mark_pending(sid, body["job_id"])  # the Stop hook re-arms --poll across turns until resolved
-        # session-id-source seam: 'env' = the harness exposed $CLAUDE_SESSION_ID (the hook's stdin id
-        # will match → the loop re-arms); 'minted' = we had to mint a per-cwd id (it will NOT match the
-        # hook's stdin id → the loop silently won't re-arm). trigger-rate reads this to distinguish
-        # id-divergence from low model-compliance.
+        # session-id-source seam: 'env' = the harness exposed the session id (the hook's stdin id will
+        # match → the loop re-arms); 'minted' = we had to mint a per-cwd id (it will NOT match the hook's
+        # stdin id → the loop silently won't re-arm). trigger-rate reads this to distinguish id-divergence
+        # from low model-compliance. Reads the SAME helper _session_id() uses, so they can't disagree.
         _log_seam(
             "session-id-source", body["job_id"],
-            extra=f"value={'env' if (os.environ.get('CLAUDE_SESSION_ID') or '').strip() else 'minted'}",
+            extra=f"value={'env' if _harness_session_id() else 'minted'}",
         )
         _log_seam("cli-posted", body["job_id"])
         print(f"job_id={body['job_id']} — Maya will call you. Poll with: maya discuss --poll {body['job_id']}")
@@ -399,7 +419,7 @@ def cmd_trigger_rate(args: list[str]) -> int:
         for the jobs the hook nudged. (A model-compliance signal — but read with the session-id caveat.)
       * resolved-rate = cli-resolved / cli-posted — did posted jobs reach a decision.
     The session-id-source tally surfaces the silent-divergence failure mode: if many discusses used a
-    'minted' id (no $CLAUDE_SESSION_ID), a low posted-rate is an ID-PLUMBING problem, not low compliance.
+    'minted' id (no $CLAUDE_CODE_SESSION_ID), a low posted-rate is an ID-PLUMBING problem, not compliance.
     """
     counts = {"hook-blocked": 0, "cli-posted": 0, "cli-resolved": 0, "cli-pending": 0, "cli-expired": 0}
     blocked_jobs: set[str] = set()
@@ -436,7 +456,7 @@ def cmd_trigger_rate(args: list[str]) -> int:
     print(f"  resolved-rate    {_rate(counts['cli-resolved'], counts['cli-posted'])}  (cli-resolved / cli-posted)")
     if id_source["env"] or id_source["minted"]:
         print(f"  session-id-source  env={id_source['env']} minted={id_source['minted']}  "
-              f"(if minted>0, $CLAUDE_SESSION_ID isn't reaching the CLI → the hook can't match; a low "
+              f"(if minted>0, $CLAUDE_CODE_SESSION_ID isn't reaching the CLI → the hook can't match; a low "
               f"posted-rate may be id-divergence, not compliance)")
     return 0
 
