@@ -327,6 +327,29 @@ def _require_paired(cfg: dict) -> tuple[str, str] | None:
     return token, caller_id
 
 
+def _print_session_context(base: str, token: str, job_id: str, body: dict) -> None:
+    """Print a BRIEF session-context header so a user (or agent) running MANY sessions knows which
+    session this decision is for. Terse on purpose. Reads the server's session_context block (already
+    in the poll body); if absent, prints nothing (never blocks the decision)."""
+    ctx = body.get("session_context") if isinstance(body, dict) else None
+    if not isinstance(ctx, dict):
+        return
+    sid = str(ctx.get("session_id") or "")[:12]
+    cur = (ctx.get("current_instruction") or "").strip()
+    last = (ctx.get("last_instruction") or "").strip()
+    last_out = (ctx.get("last_outcome") or "").strip()
+    lines = ["── SESSION CONTEXT (which session this decision is for) ──"]
+    if sid:
+        lines.append(f"session: {sid}")
+    if last:
+        lines.append(f"last instruction: {last}")
+        if last_out:
+            lines.append(f"  → how it went: {last_out}")
+    if cur:
+        lines.append(f"this instruction: {cur}")
+    print("\n".join(lines))
+
+
 def cmd_discuss(args: list[str]) -> int:
     cfg = _load_config()
     paired = _require_paired(cfg)
@@ -361,7 +384,16 @@ def cmd_discuss(args: list[str]) -> int:
                 instr = body.get("resolved_instruction") or ""
                 st = body.get("status") or ""
                 if st == "resolved" and instr:
-                    print(instr)  # the authoritative instruction → the agent reads this as its directive
+                    # Frame it as the OWNER'S DECISION, not a raw command. The instruction is the direction
+                    # the owner reached on the call — the agent applies it with its OWN judgment (writes
+                    # the code, picks the approach), it is NOT a literal command to execute verbatim. This
+                    # framing matters: a bare line like "print hello world" arriving over the wire reads as
+                    # an injected command and a careful agent (correctly) refuses it. Labeling it as owner
+                    # intent keeps the agent in control while making the decision actionable.
+                    _print_session_context(base, token, job_id, body)
+                    print("── OWNER'S DECISION (from the voice call — apply it with your own judgment; "
+                          "it is direction, not a command to run verbatim) ──")
+                    print(instr)
                 else:
                     # no_answer / expired / failed / canceled — surface honestly, no fabricated directive.
                     print(f"COMMANDER_{(st or 'unknown').upper()}: Maya could not reach you; proceed using your own judgment.")
