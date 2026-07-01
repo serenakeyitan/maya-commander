@@ -30,6 +30,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 CONFIG_DIR = os.path.expanduser("~/.maya")
@@ -599,12 +600,105 @@ def _grouped(code: str) -> str:
     return code
 
 
+def _fmt_dur(started_at: str) -> str:
+    """Rough elapsed since an ISO start (best-effort; '?' if unparseable). Stdlib-only."""
+    try:
+        from datetime import datetime, timezone
+        s = datetime.fromisoformat(started_at)
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc)
+        secs = int((datetime.now(timezone.utc) - s).total_seconds())
+        if secs < 0:
+            return "0s"
+        m, sec = divmod(secs, 60)
+        return f"{m}m{sec:02d}s" if m else f"{sec}s"
+    except Exception:
+        return "?"
+
+
+def cmd_calls(args: list[str]) -> int:
+    """List the owner's IN-PROGRESS calls (stop a runaway call without digging in the Twilio Console)."""
+    cfg = _load_config()
+    paired = _require_paired(cfg)
+    if paired is None:
+        return 1
+    token, caller_id = paired
+    base = _cloud_url(cfg)
+    q = urllib.parse.quote(caller_id, safe="")
+    status, body = _get(f"{base}/commander/calls?owner_caller_id={q}", token=token)
+    if status == 404:
+        print("✗ commander is not enabled on the server.", file=sys.stderr)
+        return 1
+    if status == 403:
+        print("✗ this machine isn't paired on the server. Re-run `maya connect`.", file=sys.stderr)
+        return 1
+    if status != 200:
+        print(f"✗ couldn't list calls (status={status}): {body.get('error', '')}", file=sys.stderr)
+        return 1
+    calls = body.get("calls") or []
+    if not calls:
+        print("no active calls")
+        return 0
+    print(f"{'SID':<36} {'TO':<15} {'STATUS':<12} {'MODE':<12} DUR")
+    for c in calls:
+        print(f"{(c.get('sid') or '')[:36]:<36} {(c.get('to') or '')[:15]:<15} "
+              f"{(c.get('live_status') or '')[:12]:<12} {(c.get('mode') or '')[:12]:<12} "
+              f"{_fmt_dur(c.get('started_at') or '')}")
+    return 0
+
+
+def cmd_hangup(args: list[str]) -> int:
+    """Hang up a call by SID, or --all to end every in-progress call this owner has."""
+    cfg = _load_config()
+    paired = _require_paired(cfg)
+    if paired is None:
+        return 1
+    token, caller_id = paired
+    base = _cloud_url(cfg)
+
+    def _hang(sid: str) -> bool:
+        st, b = _post(f"{base}/commander/calls/{urllib.parse.quote(sid, safe='')}/hangup",
+                      {"owner_caller_id": caller_id}, token=token)
+        if st == 200:
+            print(f"✓ hung up {sid[:20]}…")
+            return True
+        if st == 404:
+            print(f"✗ {sid[:20]}… — not one of your active calls", file=sys.stderr)
+        elif st == 503:
+            print("✗ outbound isn't configured on the server (nothing live to hang up).", file=sys.stderr)
+        else:
+            print(f"✗ hangup failed for {sid[:20]}… (status={st}): {b.get('error', '')}", file=sys.stderr)
+        return False
+
+    if args and args[0] == "--all":
+        # List the owner's active calls, hang each up.
+        q = urllib.parse.quote(caller_id, safe="")
+        st, b = _get(f"{base}/commander/calls?owner_caller_id={q}", token=token)
+        if st != 200:
+            print(f"✗ couldn't list calls to hang up (status={st}).", file=sys.stderr)
+            return 1
+        sids = [c.get("sid") for c in (b.get("calls") or []) if c.get("sid")]
+        if not sids:
+            print("no active calls")
+            return 0
+        ok = all(_hang(s) for s in sids)
+        return 0 if ok else 1
+
+    if not args:
+        print("usage: maya hangup <sid>   |   maya hangup --all", file=sys.stderr)
+        return 2
+    return 0 if _hang(args[0].strip()) else 1
+
+
 USAGE = """maya — voice commander for your background coding agents
 
   maya connect                connect this computer to Maya (shows a code to TYPE on your phone keypad)
   maya connect --poll         one bounded poll until this computer is linked
   maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
   maya discuss --poll <id>    one bounded poll for the resolved instruction
+  maya calls                  list your in-progress calls (SID, to, status, duration)
+  maya hangup <sid>           hang up one call by SID
+  maya hangup --all           hang up every in-progress call you have
   maya trigger-rate           tally the local seam log (the GO/NO-GO measurement)
   maya pair <code>            [legacy] redeem a long pairing code (fallback; prefer `maya connect`)
 """
@@ -622,6 +716,10 @@ def main(argv: list[str]) -> int:
         return cmd_pair(rest)
     if cmd == "discuss":
         return cmd_discuss(rest)
+    if cmd == "calls":
+        return cmd_calls(rest)
+    if cmd == "hangup":
+        return cmd_hangup(rest)
     if cmd == "trigger-rate":
         return cmd_trigger_rate(rest)
     if cmd in ("-h", "--help", "help"):
