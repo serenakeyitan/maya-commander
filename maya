@@ -473,10 +473,11 @@ def _clear_connect_pending() -> None:
 
 
 def cmd_connect(args: list[str]) -> int:
-    """Connect this computer to Maya. `maya connect` mints a 6-digit code (shown here); you CALL Maya,
-    pass your PIN, and READ HER the six digits. `maya connect --wait` mints the code AND blocks until
-    the bind lands, so you never type a second command (this is what install.sh runs). `maya connect
-    --poll` does ONE bounded poll (for the /maya-connect skill to re-arm across turns)."""
+    """Connect this computer to Maya. `maya connect` mints a pairing code (shown here); you CALL Maya,
+    pass your PIN, then TYPE the code on your phone keypad (DTMF — exact, no voice ASR). `maya connect
+    --wait` mints the code AND blocks until the bind lands, so you never type a second command (this is
+    what install.sh runs). `maya connect --poll` does ONE bounded poll (for the /maya-connect skill to
+    re-arm across turns)."""
     cfg = _load_config()
     base = _cloud_url(cfg)
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -515,8 +516,8 @@ def cmd_connect(args: list[str]) -> int:
                 print("✗ This pairing is no longer active. Run `maya connect` again for a fresh code.", file=sys.stderr)
                 return 1
             if time.monotonic() >= deadline:
-                code = rec.get("code", "??????")
-                print(f"PENDING — still waiting. Call Maya and read her: {_grouped(code)}  (re-poll continues)")
+                code = rec.get("code", "")
+                print(f"PENDING — still waiting. Call Maya, pass your PIN, then type on your keypad: {_grouped(code)}  (re-poll continues)")
                 return 0  # exit 0 → the skill re-arms; never an error exit
             time.sleep(CONNECT_POLL_INTERVAL)
 
@@ -533,14 +534,14 @@ def cmd_connect(args: list[str]) -> int:
         secret = body["pending_secret"]
         _save_connect_pending({"pending_secret": secret, "code": code})
         num = body.get("maya_number") or ""
-        # ASR-FREE pairing: ARM this row over HTTP so Maya can read the FINGERPRINT back for a yes/no.
-        # (No more reading 6 digits aloud — voice mis-heard them.) The fingerprint is what's shown big.
-        astat, abody = _post(f"{base}/commander/pair/arm", {}, token=secret)
-        fp = (abody.get("fingerprint") if astat == 200 else "") or body.get("fingerprint") or ""
+        # DTMF device-pairing: the owner TYPES this code on their phone keypad (exact, no voice ASR — the
+        # read-aloud flow mis-heard digits 3 sessions running). Binding is by WHICH code is typed, so a
+        # blind entry can't bind a stranger's machine. We do NOT arm over HTTP anymore — the keypad code
+        # IS the bind. The code is what's shown big.
         print("\n  ┌─ Connect this computer to Maya ─────────────────────────")
-        print(f"  │  Fingerprint:  {fp}")
-        print(f"  │  Call Maya{(' at ' + num) if num else ''} and say \"connect my computer.\"")
-        print(f"  │  She'll read back this fingerprint — say YES if it matches.")
+        print(f"  │  Code:  {_grouped(code)}")
+        print(f"  │  Call Maya{(' at ' + num) if num else ''}, pass your PIN, then TYPE this code")
+        print(f"  │  on your phone keypad and press #.")
         if num:
             print(f"  │  (tap to call: tel:{num})")
         print("  │  This computer:  " + _machine_label())
@@ -550,11 +551,10 @@ def cmd_connect(args: list[str]) -> int:
             return 0
         # --wait: poll in-process until bound/expired. Long budget here (the human has to dial + talk),
         # so this is NOT CONNECT_POLL_BUDGET (the short skill budget) — give them a few minutes.
-        print("Waiting for you to confirm the fingerprint with Maya… (this window will say so when you're linked)")
+        print("Waiting for you to type the code to Maya on your keypad… (this window will say so when you're linked)")
         ttl = body.get("ttl") or 180
         deadline = time.monotonic() + min(int(ttl) + 30, 600)
         try:
-            _last_arm = time.monotonic()
             while True:
                 status, pbody = _get(f"{base}/commander/pair/status", token=secret)
                 st = pbody.get("status") if status == 200 else None
@@ -569,18 +569,13 @@ def cmd_connect(args: list[str]) -> int:
                     print("\n✗ That pairing is no longer active. Just run `maya connect --wait` again for a fresh one.", file=sys.stderr)
                     return 1
                 if time.monotonic() >= deadline:
-                    print(f"\nStill waiting — the pairing may have expired. Run `maya connect --wait` again for a fresh one (fingerprint {fp}).")
+                    print(f"\nStill waiting — the pairing may have expired. Run `maya connect --wait` again for a fresh code ({_grouped(code)}).")
                     return 0  # exit 0: not an error, the user can just re-run
-                # Keep the row ARMED through a long call: the server auto-reverts armed→pending after a
-                # short TTL, so re-arm periodically while we wait (cheap; idempotent).
-                if time.monotonic() - _last_arm > 45:
-                    _post(f"{base}/commander/pair/arm", {}, token=secret)
-                    _last_arm = time.monotonic()
                 time.sleep(CONNECT_POLL_INTERVAL)
         except KeyboardInterrupt:
             # The user hit Ctrl-C (or hung up and closed the window). Don't dump a traceback — the
             # pending secret is still saved, so tell them how to resume with no data lost.
-            print(f"\nStopped waiting. Fingerprint {fp} is still good for a bit — confirm it with Maya,")
+            print(f"\nStopped waiting. Code {_grouped(code)} is still good for a bit — type it to Maya on your keypad,")
             print("then run `maya connect --poll` to finish, or `maya connect --wait` to start fresh.")
             return 0
     if status == 429:
@@ -593,16 +588,20 @@ def cmd_connect(args: list[str]) -> int:
 
 
 def _grouped(code: str) -> str:
-    """Render a 6-digit code grouped for easy reading aloud: '429185' → '4 2 9  1 8 5'."""
+    """Render the device-pairing code grouped for easy reading off the screen while TYPING it on the
+    phone keypad. 7 digits → '429 1853' (3+4, like a phone number); 6 digits (legacy) → '429 185'.
+    Any other length is returned unchanged so a future code length still prints something usable."""
     d = "".join(ch for ch in (code or "") if ch.isdigit())
+    if len(d) == 7:
+        return f"{d[0:3]} {d[3:7]}"
     if len(d) == 6:
-        return f"{d[0]} {d[1]} {d[2]}   {d[3]} {d[4]} {d[5]}"
+        return f"{d[0:3]} {d[3:6]}"
     return code
 
 
 USAGE = """maya — voice commander for your background coding agents
 
-  maya connect                connect this computer to Maya (shows a 6-digit code to read her on a call)
+  maya connect                connect this computer to Maya (shows a code to TYPE on your phone keypad)
   maya connect --poll         one bounded poll until this computer is linked
   maya discuss "<brief>"      start a voice discussion (non-blocking; prints a job_id)
   maya discuss --poll <id>    one bounded poll for the resolved instruction
